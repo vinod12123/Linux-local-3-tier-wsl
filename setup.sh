@@ -20,6 +20,16 @@ install_docker() {
 
 command -v docker >/dev/null 2>&1 || install_docker
 
+# A Docker client can be inherited from Windows/Docker Desktop even when this
+# WSL distribution has neither Desktop integration nor a native Docker service.
+# In that case, install the native engine instead of reporting only that the
+# daemon is unavailable.
+if ! docker info >/dev/null 2>&1 \
+  && ! systemctl cat docker.service >/dev/null 2>&1; then
+  info "A Docker client exists, but Ubuntu has no Docker Engine service."
+  install_docker
+fi
+
 if ! docker compose version >/dev/null 2>&1; then
   command -v apt-get >/dev/null 2>&1 || fail "Docker Compose v2 is unavailable."
   info "Installing the Docker Compose v2 plugin..."
