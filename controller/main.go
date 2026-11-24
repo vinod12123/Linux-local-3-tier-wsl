@@ -18,8 +18,6 @@ import (
 	"time"
 )
 
-const dockerAPIVersion = "v1.41"
-
 var allowedServices = map[string]serviceDefinition{
 	"frontend": {container: "astra-lab-frontend", crashCommand: []string{"sh", "-c", "sleep 1; kill -SEGV 1"}},
 	"backend":  {container: "astra-lab-backend", backendCrash: true},
@@ -33,9 +31,10 @@ type serviceDefinition struct {
 }
 
 type controller struct {
-	docker       *http.Client
-	controlToken string
-	backendURL   string
+	docker           *http.Client
+	dockerAPIVersion string
+	controlToken     string
+	backendURL       string
 }
 
 type containerState struct {
@@ -55,10 +54,15 @@ func main() {
 		},
 		Timeout: 10 * time.Second,
 	}
+	dockerAPIVersion, err := discoverDockerAPIVersion(docker)
+	if err != nil {
+		log.Fatalf("event=docker_api_negotiation_failed error=%q", err)
+	}
 	app := &controller{
-		docker:       docker,
-		controlToken: requiredEnv("LAB_CONTROL_TOKEN"),
-		backendURL:   envOr("LAB_BACKEND_URL", "http://backend:8080"),
+		docker:           docker,
+		dockerAPIVersion: dockerAPIVersion,
+		controlToken:     requiredEnv("LAB_CONTROL_TOKEN"),
+		backendURL:       envOr("LAB_BACKEND_URL", "http://backend:8080"),
 	}
 
 	mux := http.NewServeMux()
@@ -76,7 +80,7 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
-		log.Printf("event=controller_started address=%s allowed_containers=astra-lab-frontend,astra-lab-backend,astra-lab-database", server.Addr)
+		log.Printf("event=controller_started address=%s docker_api=%s allowed_containers=astra-lab-frontend,astra-lab-backend,astra-lab-database", server.Addr, app.dockerAPIVersion)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("event=controller_failed error=%q", err)
 		}
@@ -224,7 +228,7 @@ func (c *controller) dockerPost(path string, body []byte) error {
 }
 
 func (c *controller) dockerRequest(method, path string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequest(method, "http://docker/"+dockerAPIVersion+path, body)
+	req, err := http.NewRequest(method, "http://docker/"+c.dockerAPIVersion+path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -232,6 +236,44 @@ func (c *controller) dockerRequest(method, path string, body io.Reader) (*http.R
 		req.Header.Set("Content-Type", "application/json")
 	}
 	return c.docker.Do(req)
+}
+
+func discoverDockerAPIVersion(client *http.Client) (string, error) {
+	resp, err := client.Get("http://docker/version")
+	if err != nil {
+		return "", fmt.Errorf("read Docker version: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", dockerError(resp)
+	}
+	var version struct {
+		APIVersion    string `json:"ApiVersion"`
+		MinAPIVersion string `json:"MinAPIVersion"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&version); err != nil {
+		return "", fmt.Errorf("decode Docker version: %w", err)
+	}
+	if !validAPIVersion(version.APIVersion) {
+		return "", fmt.Errorf("Docker returned invalid API version %q", version.APIVersion)
+	}
+	log.Printf("event=docker_api_negotiated api_version=%s minimum_version=%s", version.APIVersion, version.MinAPIVersion)
+	return "v" + version.APIVersion, nil
+}
+
+func validAPIVersion(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	for _, part := range parts {
+		for _, char := range part {
+			if char < '0' || char > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func dockerError(resp *http.Response) error {

@@ -65,7 +65,7 @@ The containers carry `com.cloudscore.lab=true` and tier labels to make discovery
 bash status.sh
 
 # Stop the lab but keep payment data
-bash stop.sh
+bash shutdown.sh
 
 # Start/rebuild it again
 bash setup.sh
