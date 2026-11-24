@@ -1,0 +1,101 @@
+name: astra-payment-lab
+
+services:
+  database:
+    image: postgres:17-alpine
+    container_name: astra-lab-database
+    environment:
+      POSTGRES_DB: ${LAB_DB_NAME:-payments}
+      POSTGRES_USER: ${LAB_DB_USER:-payment_user}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD:-payment_local_only}
+    volumes:
+      - payment-data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LAB_DB_USER:-payment_user} -d ${LAB_DB_NAME:-payments}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [payment-lab]
+    restart: "no"
+    labels:
+      com.cloudscore.lab: "true"
+      com.cloudscore.tier: database
+
+  backend:
+    build:
+      context: ./backend
+    container_name: astra-lab-backend
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://${LAB_DB_USER:-payment_user}:${LAB_DB_PASSWORD:-payment_local_only}@database:5432/${LAB_DB_NAME:-payments}?sslmode=disable
+      LAB_CONTROL_TOKEN: ${LAB_CONTROL_TOKEN:-change-this-local-lab-token}
+    depends_on:
+      database:
+        condition: service_healthy
+    ports:
+      - "${LAB_BIND_ADDRESS:-127.0.0.1}:${LAB_API_PORT:-18081}:8080"
+    healthcheck:
+      test: ["CMD", "/app/payment-api", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [payment-lab]
+    restart: "no"
+    labels:
+      com.cloudscore.lab: "true"
+      com.cloudscore.tier: backend
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: astra-lab-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${LAB_BIND_ADDRESS:-127.0.0.1}:${LAB_FRONTEND_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [payment-lab]
+    restart: "no"
+    labels:
+      com.cloudscore.lab: "true"
+      com.cloudscore.tier: frontend
+
+  controller:
+    build:
+      context: ./controller
+    container_name: astra-lab-controller
+    environment:
+      PORT: "8082"
+      LAB_CONTROL_TOKEN: ${LAB_CONTROL_TOKEN:-change-this-local-lab-token}
+      LAB_FRONTEND_URL: http://frontend:8080
+      LAB_BACKEND_URL: http://backend:8080
+      LAB_DATABASE_HOST: database:5432
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${LAB_BIND_ADDRESS:-127.0.0.1}:${LAB_CONTROL_PORT:-18082}:8082"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [payment-lab]
+    restart: unless-stopped
+    labels:
+      com.cloudscore.lab: "true"
+      com.cloudscore.tier: controller
+
+networks:
+  payment-lab:
+    name: astra-payment-lab-network
+
+volumes:
+  payment-data:
+    name: astra-payment-lab-data
+
