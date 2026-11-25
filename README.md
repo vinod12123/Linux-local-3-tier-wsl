@@ -40,9 +40,11 @@ Create a payment first. It is written into PostgreSQL and appears in the transac
 
 Each tier has three controls:
 
-- **Crash** terminates its process abnormally. This is the appropriate case for testing an agentic restart.
+- **Crash** makes the backend process exit with code 17. For Nginx and PostgreSQL it sends a Docker kill signal. Both are real outages, and ASTRA can treat the Docker kill as an operator action. Use the backend crash to test unexpected process-exit handling.
 - **Stop** performs an intentional Docker stop. ASTRA can detect and open an incident, but should not automatically reverse an intentional human action.
 - **Restore** starts the same container again. Database data remains available because the volume is preserved.
+
+The recovery console reports success after Docker confirms the exit or the container's health check passes. To test a database outage, create a payment, stop PostgreSQL, and try to load or create a payment. The API returns a real HTTP 503 and logs the database error. Restore PostgreSQL and reload the payment history to check the original record.
 
 If Nginx is stopped or crashed, open the recovery console directly on port `18082` to restore it.
 

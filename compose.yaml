@@ -12,7 +12,7 @@ services:
       - payment-data:/var/lib/postgresql/data
       - ./database/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${LAB_DB_USER:-payment_user} -d ${LAB_DB_NAME:-payments}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 20

@@ -121,6 +121,10 @@ func (a *application) listPayments(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, p)
 	}
+	if err := rows.Err(); err != nil {
+		a.databaseError(w, "read_payments", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, items)
 }
 

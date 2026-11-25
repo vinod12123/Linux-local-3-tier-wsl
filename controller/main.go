@@ -14,19 +14,19 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 var allowedServices = map[string]serviceDefinition{
-	"frontend": {container: "astra-lab-frontend", crashCommand: []string{"sh", "-c", "sleep 1; kill -SEGV 1"}},
+	"frontend": {container: "astra-lab-frontend"},
 	"backend":  {container: "astra-lab-backend", backendCrash: true},
-	"database": {container: "astra-lab-database", crashCommand: []string{"sh", "-c", "sleep 1; kill -ABRT 1"}},
+	"database": {container: "astra-lab-database"},
 }
 
 type serviceDefinition struct {
 	container    string
-	crashCommand []string
 	backendCrash bool
 }
 
@@ -35,6 +35,7 @@ type controller struct {
 	dockerAPIVersion string
 	controlToken     string
 	backendURL       string
+	actionLock       sync.Mutex
 }
 
 type containerState struct {
@@ -42,7 +43,9 @@ type containerState struct {
 	Running bool   `json:"running"`
 	Status  string `json:"status"`
 	Health  string `json:"health"`
-	Exit    int    `json:"exitCode"`
+	Exit    *int   `json:"exitCode,omitempty"`
+	id      string
+	tier    string
 }
 
 func main() {
@@ -52,7 +55,7 @@ func main() {
 				return (&net.Dialer{}).DialContext(ctx, "unix", "/var/run/docker.sock")
 			},
 		},
-		Timeout: 10 * time.Second,
+		Timeout: 14 * time.Second,
 	}
 	dockerAPIVersion, err := discoverDockerAPIVersion(docker)
 	if err != nil {
@@ -76,7 +79,7 @@ func main() {
 		Handler:           securityHeaders(requestLogger(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      40 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
@@ -108,6 +111,10 @@ func (c *controller) status(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (c *controller) action(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Lab-Action") != "1" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "lab action header is required"})
+		return
+	}
 	serviceName := r.PathValue("service")
 	action := r.PathValue("action")
 	service, allowed := allowedServices[serviceName]
@@ -115,29 +122,85 @@ func (c *controller) action(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown lab service"})
 		return
 	}
-	var err error
+	if !c.actionLock.TryLock() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "another lab action is still running"})
+		return
+	}
+	defer c.actionLock.Unlock()
+
+	state, err := c.inspect(service.container)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	if state.tier != serviceName || state.id == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "container does not belong to this lab tier"})
+		return
+	}
+	if action == "crash" && !state.Running {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "start this container before crashing it"})
+		return
+	}
+	path := "/containers/" + url.PathEscape(state.id)
 	switch action {
 	case "stop":
-		err = c.dockerPost("/containers/"+url.PathEscape(service.container)+"/stop?t=10", nil)
+		if state.Running {
+			err = c.dockerPost(path+"/stop?t=10", nil)
+		}
 	case "restore":
-		err = c.dockerPost("/containers/"+url.PathEscape(service.container)+"/start", nil)
+		if !state.Running {
+			err = c.dockerPost(path+"/start", nil)
+		}
 	case "crash":
 		if service.backendCrash {
 			err = c.crashBackend()
 		} else {
-			err = c.exec(service.container, service.crashCommand)
+			err = c.dockerPost(path+"/kill?signal=SIGKILL", nil)
 		}
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "action must be stop, crash, or restore"})
 		return
+	}
+	if err == nil {
+		state, err = c.waitForAction(state.id, action)
 	}
 	if err != nil {
 		log.Printf("level=error event=simulation_failed service=%s action=%s error=%q", serviceName, action, err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error(), "service": serviceName, "action": action})
 		return
 	}
-	log.Printf("level=warning event=simulation_triggered service=%s action=%s", serviceName, action)
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted", "service": serviceName, "action": action})
+	log.Printf("event=lab_action_verified service=%s action=%s docker_status=%s", serviceName, action, state.Status)
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (c *controller) waitForAction(id, action string) (containerState, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		state, err := c.inspect(id)
+		if err != nil {
+			return containerState{}, err
+		}
+		if actionObserved(state, action) {
+			return state, nil
+		}
+		if time.Now().After(deadline) {
+			return state, fmt.Errorf("Docker has not confirmed %s (state: %s, health: %s)", action, state.Status, state.Health)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func actionObserved(state containerState, action string) bool {
+	switch action {
+	case "restore":
+		return state.Running && state.Health == "healthy"
+	case "stop":
+		return state.Status == "exited"
+	case "crash":
+		return state.Status == "exited" && state.Exit != nil && *state.Exit != 0
+	default:
+		return false
+	}
 }
 
 func (c *controller) inspect(container string) (containerState, error) {
@@ -150,7 +213,11 @@ func (c *controller) inspect(container string) (containerState, error) {
 		return containerState{}, dockerError(resp)
 	}
 	var payload struct {
-		Name  string `json:"Name"`
+		ID     string `json:"Id"`
+		Name   string `json:"Name"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
 		State struct {
 			Running  bool   `json:"Running"`
 			Status   string `json:"Status"`
@@ -164,12 +231,21 @@ func (c *controller) inspect(container string) (containerState, error) {
 		return containerState{}, err
 	}
 	health := "not-configured"
-	if payload.State.Health != nil {
+	if payload.State.Running && payload.State.Health != nil {
 		health = payload.State.Health.Status
+	}
+	var exit *int
+	if payload.State.Status == "exited" {
+		exit = &payload.State.ExitCode
+	}
+	tier := ""
+	if payload.Config.Labels["com.cloudscore.lab"] == "true" &&
+		payload.Config.Labels["com.docker.compose.project"] == "astra-payment-lab" {
+		tier = payload.Config.Labels["com.cloudscore.tier"]
 	}
 	return containerState{
 		Name: strings.TrimPrefix(payload.Name, "/"), Running: payload.State.Running,
-		Status: payload.State.Status, Health: health, Exit: payload.State.ExitCode,
+		Status: payload.State.Status, Health: health, Exit: exit, id: payload.ID, tier: tier,
 	}, nil
 }
 
@@ -189,30 +265,6 @@ func (c *controller) crashBackend() error {
 		return fmt.Errorf("backend refused crash request: HTTP %d", resp.StatusCode)
 	}
 	return nil
-}
-
-func (c *controller) exec(container string, command []string) error {
-	payload, _ := json.Marshal(map[string]any{
-		"AttachStdout": false, "AttachStderr": false, "Tty": false, "Cmd": command,
-	})
-	resp, err := c.dockerRequest(http.MethodPost, "/containers/"+url.PathEscape(container)+"/exec", bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		return dockerError(resp)
-	}
-	var created struct {
-		ID string `json:"Id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
-		return err
-	}
-	if created.ID == "" {
-		return fmt.Errorf("Docker returned no exec ID")
-	}
-	return c.dockerPost("/exec/"+url.PathEscape(created.ID)+"/start", []byte(`{"Detach":true,"Tty":false}`))
 }
 
 func (c *controller) dockerPost(path string, body []byte) error {
@@ -334,6 +386,6 @@ body{font:16px system-ui;background:#0b1220;color:#e5e7eb;margin:0}.wrap{max-wid
 <script>
 const names=['frontend','backend','database'];
 async function refresh(){try{const r=await fetch('/api/status');const data=await r.json();document.querySelector('#services').innerHTML=names.map(n=>{const s=data[n]||{};const up=s.running;return '<article class="card"><h2>'+n+'</h2><div class="state '+(up?'up':'down')+'">'+(s.status||'unknown')+' · '+(s.health||'unknown')+' · exit '+(s.exitCode??'-')+'</div><button class="crash" onclick="act(\''+n+'\',\'crash\')">Crash</button><button class="stop" onclick="act(\''+n+'\',\'stop\')">Stop</button><button class="restore" onclick="act(\''+n+'\',\'restore\')">Restore</button></article>'}).join('')}catch(e){msg(e.message)}}
-async function act(service,action){if(!confirm(action+' '+service+'?'))return;try{const r=await fetch('/api/services/'+service+'/'+action,{method:'POST'});const body=await r.json();msg(JSON.stringify(body,null,2));setTimeout(refresh,1200)}catch(e){msg(e.message)}}
+async function act(service,action){if(!confirm(action+' '+service+'?'))return;try{const r=await fetch('/api/services/'+service+'/'+action,{method:'POST',headers:{'X-Lab-Action':'1'}});const body=await r.json();msg(r.ok?'Docker confirmed '+service+': '+body.status+(body.exitCode==null?' · '+body.health:' · exit '+body.exitCode):body.error);await refresh()}catch(e){msg(e.message)}}
 function msg(v){document.querySelector('#message').textContent=v}refresh();setInterval(refresh,5000);
 </script></body></html>`
