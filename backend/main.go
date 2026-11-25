@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -62,6 +63,9 @@ func main() {
 	mux.HandleFunc("GET /health/ready", app.ready)
 	mux.HandleFunc("GET /api/payments", app.listPayments)
 	mux.HandleFunc("POST /api/payments", app.createPayment)
+	mux.HandleFunc("POST /api/lab/exception", app.labException)
+	mux.HandleFunc("POST /api/lab/database-error", app.labDatabaseError)
+	mux.HandleFunc("POST /api/lab/slow-query", app.labSlowQuery)
 	mux.HandleFunc("POST /_lab/crash", app.crash)
 
 	server := &http.Server{
@@ -186,6 +190,59 @@ func (a *application) crash(w http.ResponseWriter, r *http.Request) {
 func (a *application) databaseError(w http.ResponseWriter, operation string, err error) {
 	log.Printf("level=error event=database_operation_failed operation=%s error=%q", operation, err)
 	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database unavailable", "operation": operation})
+}
+
+func (a *application) labException(w http.ResponseWriter, r *http.Request) {
+	if !allowLabRequest(w, r) {
+		return
+	}
+	defer func() {
+		if failure := recover(); failure != nil {
+			log.Printf("level=error event=api_exception path=%s error=%q", r.URL.Path, failure)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "request handler panicked"})
+		}
+	}()
+	panic("AstraPay lab: deliberate payment handler panic")
+}
+
+func (a *application) labDatabaseError(w http.ResponseWriter, r *http.Request) {
+	if !allowLabRequest(w, r) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+	defer cancel()
+	if _, err := a.db.Exec(ctx, "SELECT 1 / 0"); err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == "22012" {
+			log.Printf("level=error event=database_query_failed sqlstate=%s error=%q", pgError.Code, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": pgError.Message, "sqlstate": pgError.Code})
+			return
+		}
+		a.databaseError(w, "lab_query", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "query completed without an error"})
+}
+
+func (a *application) labSlowQuery(w http.ResponseWriter, r *http.Request) {
+	if !allowLabRequest(w, r) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := a.db.Exec(ctx, "SELECT pg_sleep(2)"); err != nil {
+		a.databaseError(w, "lab_slow_query", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "database query completed"})
+}
+
+func allowLabRequest(w http.ResponseWriter, r *http.Request) bool {
+	if r.Header.Get("X-Lab-Action") == "1" {
+		return true
+	}
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": "lab action header is required"})
+	return false
 }
 
 func requestLogger(next http.Handler) http.Handler {

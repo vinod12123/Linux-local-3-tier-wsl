@@ -1,119 +1,274 @@
-const services = {
-  frontend: 'Stops Nginx, making the payment site unavailable.',
-  backend: 'Stops the API; Nginx produces a real 502 response.',
-  database: 'Stops PostgreSQL; API operations produce real 503 errors.'
+const tierCards = [...document.querySelectorAll('[data-tier]')];
+const overall = document.querySelector('#overall-status');
+const banner = document.querySelector('#banner');
+const requestTable = document.querySelector('#request-results');
+const paymentsTable = document.querySelector('#payments');
+const batchStatus = document.querySelector('#batch-status');
+const stopBatch = document.querySelector('#stop-batch');
+const batchButtons = [...document.querySelectorAll('[data-batch]')];
+const labHeaders = { 'X-Lab-Action': '1' };
+const requests = {
+  read: { label: 'Read payments', path: '/api/payments' },
+  exception: { label: 'API exception', path: '/api/lab/exception', method: 'POST' },
+  databaseError: { label: 'PostgreSQL query error', path: '/api/lab/database-error', method: 'POST' },
+  slowQuery: { label: 'Slow PostgreSQL query', path: '/api/lab/slow-query', method: 'POST' }
 };
-
-const money = (cents, currency) => new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(cents / 100);
-const escapeHTML = (value) => String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
-
+const batchSizes = { read: 30, exception: 8, databaseError: 8 };
+let actionPending = false;
+let batchRunning = false;
+let batchStopped = false;
 let paymentRequest = 0;
-let previousTierState = '';
+let statusRequest = 0;
+let lastState = '';
 
-  if (!response.ok) {
-    const status = `HTTP ${response.status}`;
-    throw new Error(body.error && body.error !== status ? `${status}: ${body.error}` : status);
-  }
-function showBanner(message, kind = 'error') {
-  const banner = document.querySelector('#banner');
+function show(message, error = false) {
   banner.textContent = message;
-  banner.className = `banner ${kind}`;
-  clearTimeout(showBanner.timer);
-  showBanner.timer = setTimeout(() => banner.classList.add('hidden'), 7000);
+  banner.classList.toggle('error', error);
+  banner.hidden = false;
 }
 
-async function jsonRequest(url, options) {
-  const response = await fetch(url, options);
-  let body;
-  try { body = await response.json(); } catch { body = { error: `HTTP ${response.status}` }; }
-  return body;
-}
-
-async function loadPayments(showError = false) {
-  const tbody = document.querySelector('#payments');
-  const request = ++paymentRequest;
+async function request(path, { timeout = 8000, ...options } = {}) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), timeout);
   try {
-    const rows = await jsonRequest('/api/payments', { cache: 'no-store' });
-    if (request !== paymentRequest) return;
-    tbody.innerHTML = rows.length ? rows.map(p => `<tr><td>${new Date(p.createdAt).toLocaleString()}</td><td>${escapeHTML(p.customerName)}</td><td>${money(p.amountCents,p.currency)}</td><td class="status-approved">${escapeHTML(p.status)}</td><td class="mono">${escapeHTML(p.id.slice(0,8))}</td></tr>`).join('') : '<tr><td colspan="5" class="empty">No payments yet. Create the first real database record above.</td></tr>';
+    const response = await fetch(path, { cache: 'no-store', ...options, signal: abort.signal });
+    const body = response.headers.get('content-type')?.includes('application/json')
+      ? await response.json()
+      : null;
+    if (!response.ok) {
+      const details = body?.sqlstate ? body.error + ' (SQLSTATE ' + body.sqlstate + ')' : body?.error;
+      const error = new Error('HTTP ' + response.status + (details ? ' · ' + details : ''));
+      error.status = response.status;
+      throw error;
+    }
+    if (body === null) throw new Error('Unexpected non-JSON response from ' + path);
+    return { body, status: response.status };
   } catch (error) {
-    if (request !== paymentRequest) return;
-    tbody.innerHTML = `<tr><td colspan="5" class="empty">Data unavailable: ${escapeHTML(error.message)}</td></tr>`;
-    if (showError) showBanner(`Payment data could not be loaded: ${error.message}`);
+    if (error.name === 'AbortError') throw new Error('Request timed out');
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+function describeState(state) {
+  if (!state || state.status === 'unavailable') return { text: 'Unknown', tone: '' };
+  if (state.exitCode != null) return { text: 'Exited · ' + state.exitCode, tone: 'down' };
+  if (state.running && state.health === 'healthy') return { text: 'Healthy', tone: 'ok' };
+  if (state.running) return { text: state.health || 'Running', tone: 'down' };
+  return { text: state.status || 'Unknown', tone: 'down' };
+}
+
+function renderStatus(states) {
+  let healthy = 0;
+  let unknown = false;
+  for (const card of tierCards) {
+    const state = states?.[card.dataset.tier];
+    const badge = card.querySelector('.tier-state');
+    const description = describeState(state);
+    badge.textContent = description.text;
+    badge.className = 'badge tier-state ' + description.tone;
+    healthy += Number(description.tone === 'ok');
+    const known = Boolean(state?.status && state.status !== 'unavailable');
+    unknown ||= !known;
+    for (const button of card.querySelectorAll('[data-action]')) {
+      const restore = button.dataset.action === 'restore';
+      button.disabled = actionPending || !known || (restore ? state.running : !state.running);
+    }
+  }
+  overall.className = 'badge ' + (unknown ? '' : healthy === tierCards.length ? 'ok' : 'down');
+  overall.textContent = unknown ? 'Docker state unavailable' : healthy + ' / ' + tierCards.length + ' tiers healthy';
 }
 
 async function loadStatus() {
-  const list = document.querySelector('#service-status');
+  const current = ++statusRequest;
   try {
-    const states = await jsonRequest('/lab-api/status', { cache: 'no-store' });
-    let allUp = true;
-    let unknown = false;
-    list.innerHTML = Object.keys(services).map(name => {
-      const state = states[name] || {};
-      const healthy = state.running && state.health === 'healthy';
-      allUp = allUp && healthy;
-      unknown = unknown || !state.status || state.status === 'unavailable';
-      return `<div class="service-item"><div><span class="dot ${healthy?'up':''}"></span><span class="service-name">${name}</span></div><span class="service-detail">${escapeHTML(formatState(state))}</span></div>`;
-    }).join('');
-    const overall = document.querySelector('#overall-status');
-    overall.textContent = unknown ? 'Docker state unavailable' : allUp ? 'All tier checks passing' : 'Tier stopped or not ready';
-    overall.className = `badge ${unknown ? 'neutral' : allUp ? 'healthy' : 'unhealthy'}`;
-    const tierState = Object.keys(services).map(name => formatState(states[name] || {})).join('|');
-    if (previousTierState && tierState !== previousTierState) loadPayments();
-    previousTierState = tierState;
-  } catch (error) {
-    list.innerHTML = `<div class="empty">Controller unavailable: ${escapeHTML(error.message)}</div>`;
-    const overall = document.querySelector('#overall-status');
-    overall.textContent = 'Docker state unavailable';
-    overall.className = 'badge neutral';
+    const { body: states } = await request('/lab-api/status');
+    if (current !== statusRequest) return;
+    renderStatus(states);
+    const signature = JSON.stringify(states);
+    if (lastState && signature !== lastState) loadPayments();
+    lastState = signature;
+  } catch {
+    if (current === statusRequest) renderStatus(null);
   }
 }
 
-function formatState(state) {
-  if (state.exitCode != null) return `${state.status} · exit ${state.exitCode}`;
-  if (state.running) return `${state.status} · ${state.health}`;
-  return state.status || 'unknown';
+async function pollStatus() {
+  await loadStatus();
+  setTimeout(pollStatus, 5000);
 }
 
-async function runAction(service, action, button) {
-  const label = action === 'restore' ? 'restore' : `${action} (cause a real outage in)`;
-  if (!window.confirm(`Do you want to ${label} the ${service} tier?`)) return;
-  button.disabled = true;
+function row(table, cells) {
+  const rowElement = table.insertRow();
+  for (const text of cells) rowElement.insertCell().textContent = text;
+  return rowElement;
+}
+
+function emptyRow(table, columns, text) {
+  const cell = row(table, [text]).cells[0];
+  cell.colSpan = columns;
+  cell.className = 'empty';
+}
+
+function formatPaymentAmount(payment) {
+  const amount = payment.amountCents / 100;
   try {
-    const state = await jsonRequest(`/lab-api/services/${service}/${action}`, {
-      method: 'POST',
-      headers: { 'X-Lab-Action': '1' }
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency: payment.currency }).format(amount);
+  } catch {
+    return amount.toFixed(2) + ' ' + payment.currency;
+  }
+}
+
+async function loadPayments() {
+  const current = ++paymentRequest;
+  try {
+    const { body } = await request('/api/payments');
+    if (!Array.isArray(body)) throw new Error('Unexpected payment response');
+    if (current !== paymentRequest) return;
+    paymentsTable.replaceChildren();
+    if (body.length === 0) emptyRow(paymentsTable, 4, 'No payments recorded.');
+    for (const payment of body) {
+      row(paymentsTable, [
+        new Date(payment.createdAt).toLocaleString(),
+        payment.customerName,
+        formatPaymentAmount(payment),
+        payment.status
+      ]);
+    }
+  } catch (error) {
+    if (current !== paymentRequest) return;
+    paymentsTable.replaceChildren();
+    emptyRow(paymentsTable, 4, 'Payment history unavailable · ' + error.message);
+  }
+}
+
+async function runAction(tier, action) {
+  if (actionPending) return;
+  if (action !== 'restore' && !window.confirm(action + ' the ' + tier + ' container? This will interrupt the lab.')) return;
+  actionPending = true;
+  for (const button of document.querySelectorAll('[data-action]')) button.disabled = true;
+  show('Waiting for Docker to confirm ' + action + ' on ' + tier + '…');
+  try {
+    const { body } = await request('/lab-api/services/' + tier + '/' + action, {
+      method: 'POST', headers: labHeaders, timeout: 48000
     });
-    showBanner(`Docker confirmed ${service}: ${formatState(state)}.`, action === 'restore' ? 'success' : 'error');
+    show('Docker confirmed ' + tier + ' · ' + describeState(body).text);
   } catch (error) {
-    const recovery = service === 'frontend' && action !== 'restore' ? ' Check the recovery console for its live state.' : '';
-    showBanner(`Could not verify ${service} ${action}: ${error.message}.${recovery}`);
+    const recovery = tier === 'frontend' ? ' Check the recovery console for the actual state.' : '';
+    show('Could not verify ' + action + ' on ' + tier + ' · ' + error.message + '.' + recovery, true);
   } finally {
+    actionPending = false;
     await Promise.all([loadStatus(), loadPayments()]);
-    button.disabled = false;
   }
 }
 
-document.querySelector('#simulation-grid').innerHTML = Object.entries(services).map(([name, description]) => `<article class="simulation-card"><h4>${name}</h4><p>${description}</p><div class="button-row"><button class="danger" data-service="${name}" data-action="crash">Crash</button><button class="warning" data-service="${name}" data-action="stop">Stop</button><button class="restore" data-service="${name}" data-action="restore">Restore</button></div></article>`).join('');
-document.querySelector('#simulation-grid').addEventListener('click', event => {
-  const button = event.target.closest('button[data-service]');
-  if (button) runAction(button.dataset.service, button.dataset.action, button);
+function recordRequest(label, text, started, failed) {
+  if (requestTable.rows[0]?.cells.length === 1) requestTable.deleteRow(0);
+  row(requestTable, [new Date().toLocaleTimeString(), label, text, Math.round(performance.now() - started) + ' ms']);
+  const latest = requestTable.rows[requestTable.rows.length - 1];
+  if (failed) latest.cells[2].className = 'result-error';
+  requestTable.prepend(latest);
+  if (requestTable.rows.length > 30) requestTable.deleteRow(-1);
+}
+
+async function runRequest(name) {
+  const { label, path, method = 'GET' } = requests[name];
+  const started = performance.now();
+  try {
+    const { status } = await request(path, { method, headers: labHeaders });
+    recordRequest(label, 'HTTP ' + status, started, false);
+    return true;
+  } catch (error) {
+    recordRequest(label, error.message, started, true);
+    return false;
+  }
+}
+
+async function runBatch(name) {
+  if (batchRunning) return;
+  batchRunning = true;
+  batchStopped = false;
+  for (const button of batchButtons) button.disabled = true;
+  stopBatch.disabled = false;
+  let completed = 0;
+  let successes = 0;
+  const max = batchSizes[name];
+  const progress = () => completed + ' / ' + max + ' completed · ' + successes + ' succeeded · ' + (completed - successes) + ' failed';
+  batchStatus.textContent = progress();
+  try {
+    while (completed < max && !batchStopped) {
+      if (await runRequest(name)) successes++;
+      completed++;
+      batchStatus.textContent = progress();
+      if (completed < max && !batchStopped) await new Promise(resolve => setTimeout(resolve, 150));
+    }
+  } finally {
+    batchStatus.textContent = (batchStopped ? 'Stopped · ' : 'Finished · ') + progress();
+    batchRunning = false;
+    stopBatch.disabled = true;
+    for (const button of batchButtons) button.disabled = false;
+  }
+}
+
+for (const card of tierCards) {
+  for (const button of card.querySelectorAll('[data-action]')) {
+    button.addEventListener('click', () => runAction(card.dataset.tier, button.dataset.action));
+  }
+}
+for (const button of document.querySelectorAll('[data-request]')) {
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      await runRequest(button.dataset.request);
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+for (const button of batchButtons) button.addEventListener('click', () => runBatch(button.dataset.batch));
+stopBatch.addEventListener('click', () => {
+  batchStopped = true;
+  stopBatch.disabled = true;
 });
+document.querySelector('#scenario-filter').addEventListener('change', event => {
+  document.querySelector('#availability').hidden = event.target.value === 'requests';
+  document.querySelector('#traffic').hidden = event.target.value === 'availability';
+});
+for (const link of document.querySelectorAll('nav a')) {
+  link.addEventListener('click', () => {
+    document.querySelector('#scenario-filter').value = 'all';
+    document.querySelector('#availability').hidden = false;
+    document.querySelector('#traffic').hidden = false;
+  });
+}
 document.querySelector('#payment-form').addEventListener('submit', async event => {
   event.preventDefault();
   const form = event.currentTarget;
   const button = form.querySelector('button');
+  const feedback = document.querySelector('#payment-feedback');
+  const started = performance.now();
   button.disabled = true;
+  feedback.textContent = 'Saving payment…';
   try {
-    const result = await jsonRequest('/api/payments', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({customerName:document.querySelector('#customer').value,amount:document.querySelector('#amount').value,currency:document.querySelector('#currency').value}) });
-    showBanner(`Payment ${result.id.slice(0,8)} was stored in PostgreSQL.`, 'success');
+    const { body, status } = await request('/api/payments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.fromEntries(new FormData(form)))
+    });
+    recordRequest('Save payment', 'HTTP ' + status, started, false);
+    feedback.textContent = 'Payment ' + body.id.slice(0, 8) + ' saved to PostgreSQL.';
     form.reset();
     await loadPayments();
-  } catch (error) { showBanner(`Payment failed: ${error.message}`); }
-  finally { button.disabled = false; }
+  } catch (error) {
+    recordRequest('Save payment', error.message, started, true);
+    feedback.textContent = 'Payment failed · ' + error.message;
+  } finally {
+    button.disabled = false;
+  }
 });
-document.querySelector('#refresh-payments').addEventListener('click', () => loadPayments(true));
+document.querySelector('#refresh-payments').addEventListener('click', loadPayments);
 document.querySelector('#refresh-status').addEventListener('click', loadStatus);
-loadPayments(); loadStatus(); setInterval(loadStatus, 5000);
+loadPayments();
+pollStatus();
 

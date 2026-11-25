@@ -102,6 +102,14 @@ if [[ "${frontend_state:-}" != healthy || "${backend_state:-}" != healthy || "${
   fail "The lab did not become healthy within 180 seconds. The containers remain available for inspection."
 fi
 
+info "Checking payment and simulation routes through Nginx..."
+for route in /app.js /api/payments /lab-api/status; do
+  if ! "${DOCKER[@]}" compose exec -T frontend wget -T 10 -q -O /dev/null "http://127.0.0.1:8080${route}"; then
+    "${DOCKER[@]}" compose logs --tail=30 frontend backend controller >&2
+    fail "Nginx could not serve ${route}. The lab is running for inspection."
+  fi
+done
+
 host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
 info "Application is ready."
 printf '\n  Payment application: http://localhost:%s\n' "$frontend_port"

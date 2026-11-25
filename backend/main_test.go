@@ -1,6 +1,27 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestLabException(t *testing.T) {
+	app := &application{}
+	request := httptest.NewRequest(http.MethodPost, "/api/lab/exception", nil)
+	response := httptest.NewRecorder()
+	app.labException(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("unguarded exception status = %d", response.Code)
+	}
+
+	request.Header.Set("X-Lab-Action", "1")
+	response = httptest.NewRecorder()
+	app.labException(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("recovered exception status = %d", response.Code)
+	}
+}
 
 func TestParseAmount(t *testing.T) {
 	tests := []struct {

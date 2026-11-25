@@ -3,83 +3,125 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AstraPay — Three-tier failure lab</title>
-  <link rel="stylesheet" href="/styles.css">
+  <title>AstraPay | Simulation Lab</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script defer src="./app.js"></script>
 </head>
 <body>
-  <header class="topbar">
-    <div>
-      <span class="eyebrow">CLOUDSCORE LOCAL LAB</span>
-      <h1>AstraPay</h1>
-    </div>
-    <div class="header-actions">
-      <span id="overall-status" class="badge neutral">Checking services…</span>
-      <a class="secondary-button" href="http://localhost:18082" target="_blank" rel="noreferrer">Recovery console</a>
-    </div>
-  </header>
-
-  <main>
-    <section class="hero">
+  <aside class="sidebar">
+    <a class="brand" href="#simulation">AstraPay<span>Payment lab</span></a>
+    <nav aria-label="Lab sections">
+      <a class="nav-primary" href="#simulation">Simulation</a>
+      <a href="#traffic">Request tests</a>
+      <a href="#payments-section">Payments</a>
+    </nav>
+    <p class="sidebar-note">Nginx, Go API, PostgreSQL<br>Local Docker environment</p>
+  </aside>
+  <main id="simulation">
+    <header class="page-header">
       <div>
-        <p class="eyebrow">REAL THREE-TIER APPLICATION</p>
-        <h2>Process a payment, then break a real dependency.</h2>
-        <p>Transactions are written to PostgreSQL. Failures stop or crash actual containers and produce real HTTP errors, logs and lifecycle events.</p>
+        <p class="breadcrumb">AstraPay / Simulation lab</p>
+        <h1>Simulation</h1>
+        <p class="muted">Interrupt a tier or send a test request, then check what ASTRA receives.</p>
       </div>
-      <div class="flow" aria-label="Application architecture">
-        <span>Nginx frontend</span><b>→</b><span>Go API</span><b>→</b><span>PostgreSQL</span>
+      <a class="button secondary recovery-link" href="http://localhost:18082" target="_blank" rel="noopener">Open recovery console</a>
+    </header>
+
+    <p class="notice"><strong>These actions change the running lab.</strong> Keep the recovery console open before stopping Nginx. Payment records stay in PostgreSQL’s Docker volume.</p>
+    <noscript><p class="notice">Enable JavaScript to load live service status and run lab actions. You can also use the separate recovery console.</p></noscript>
+    <div id="banner" class="feedback" role="status" hidden></div>
+    <div class="toolbar">
+      <label for="scenario-filter">Scenario</label>
+      <select id="scenario-filter">
+        <option value="all">All scenarios</option>
+        <option value="availability">Availability</option>
+        <option value="requests">Request tests</option>
+      </select>
+      <span id="overall-status" class="badge" role="status">Checking Docker state</span>
+      <button id="refresh-status" class="secondary" type="button">Refresh status</button>
+    </div>
+
+    <section id="availability" class="section" aria-labelledby="availability-title">
+      <h2 id="availability-title">Availability</h2>
+      <div class="cards">
+        <article class="card" data-tier="frontend">
+          <header><div><h3>Frontend down</h3><p>Nginx web server</p></div><span class="badge tier-state">Checking</span></header>
+          <p>The payment page becomes unreachable. The API and PostgreSQL keep running.</p>
+          <p class="signal">Watch the website probe and the frontend container’s lifecycle.</p>
+          <div class="actions"><button class="danger" data-action="stop" disabled>Stop</button><button class="secondary" data-action="crash" disabled>Crash</button><button class="secondary" data-action="restore" disabled>Restore</button></div>
+        </article>
+        <article class="card" data-tier="backend">
+          <header><div><h3>API down</h3><p>Go payment service</p></div><span class="badge tier-state">Checking</span></header>
+          <p>The site loads, but payment requests through Nginx fail. PostgreSQL keeps running.</p>
+          <p class="signal">Watch Nginx upstream errors and the API process exit.</p>
+          <div class="actions"><button class="danger" data-action="stop" disabled>Stop</button><button class="secondary" data-action="crash" disabled>Crash</button><button class="secondary" data-action="restore" disabled>Restore</button></div>
+        </article>
+        <article class="card" data-tier="database">
+          <header><div><h3>PostgreSQL down</h3><p>Payment database</p></div><span class="badge tier-state">Checking</span></header>
+          <p>The API stays running. Payment reads and writes fail until PostgreSQL is restored.</p>
+          <p class="signal">Watch the API’s PostgreSQL connection errors and HTTP 503 responses.</p>
+          <div class="actions"><button class="danger" data-action="stop" disabled>Stop</button><button class="secondary" data-action="crash" disabled>Crash</button><button class="secondary" data-action="restore" disabled>Restore</button></div>
+        </article>
       </div>
     </section>
 
-    <div id="banner" class="banner hidden" role="alert"></div>
-
-    <section class="layout">
-      <article class="panel">
-        <div class="panel-heading">
-          <div><p class="eyebrow">PAYMENT</p><h3>New transaction</h3></div>
+    <section id="traffic" class="section" aria-labelledby="traffic-title">
+      <h2 id="traffic-title">Request tests</h2>
+      <div class="panel">
+        <h3>Controlled traffic</h3>
+        <p class="muted">Sends requests one at a time through Nginx. Stop cancels the remaining requests.</p>
+        <div class="actions">
+          <button data-batch="read" type="button">30 payment reads</button>
+          <button class="danger" data-batch="exception" type="button">8 API exceptions</button>
+          <button class="danger" data-batch="databaseError" type="button">8 PostgreSQL errors</button>
+          <button id="stop-batch" class="secondary" type="button" disabled>Stop run</button>
         </div>
-        <form id="payment-form">
-          <label>Customer name<input id="customer" name="customerName" maxlength="80" required placeholder="e.g. Priya Rao"></label>
-          <div class="form-row">
-            <label>Amount<input id="amount" name="amount" required inputmode="decimal" pattern="[0-9]+([.][0-9]{1,2})?" placeholder="49.99"></label>
-            <label>Currency<select id="currency" name="currency"><option>USD</option><option>INR</option><option>EUR</option><option>GBP</option></select></label>
-          </div>
-          <button class="primary-button" type="submit">Process payment</button>
-        </form>
-      </article>
-
-      <article class="panel">
-        <div class="panel-heading">
-          <div><p class="eyebrow">DEPENDENCIES</p><h3>Live service state</h3></div>
-          <button id="refresh-status" class="text-button">Refresh</button>
+        <p id="batch-status" class="muted" role="status">No batch running.</p>
+      </div>
+      <div class="panel">
+        <h3>Single requests</h3>
+        <div class="requests">
+          <button type="button" class="secondary" data-request="read">Read payments</button>
+          <button type="button" class="secondary" data-request="exception">Trigger API exception</button>
+          <button type="button" class="secondary" data-request="databaseError">Trigger PostgreSQL query error</button>
+          <button type="button" class="secondary" data-request="slowQuery">Run slow PostgreSQL query</button>
         </div>
-        <div id="service-status" class="service-list"></div>
-      </article>
+      </div>
+      <div class="panel">
+        <h3>Recent request results</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th scope="col">Time</th><th scope="col">Request</th><th scope="col">Response</th><th scope="col">Duration</th></tr></thead>
+          <tbody id="request-results"><tr><td colspan="4" class="empty">Run a request to see its result.</td></tr></tbody>
+        </table></div>
+      </div>
     </section>
 
-    <section class="panel simulation-panel">
-      <div class="panel-heading">
-        <div><p class="eyebrow">FAILURE SIMULATION</p><h3>Cause a genuine outage</h3></div>
-        <p class="hint"><strong>Crash</strong> exits abnormally. <strong>Stop</strong> records an intentional Docker stop. Restore starts the same container.</p>
-      </div>
-      <div id="simulation-grid" class="simulation-grid"></div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-heading">
-        <div><p class="eyebrow">POSTGRESQL DATA</p><h3>Recent payments</h3></div>
-        <button id="refresh-payments" class="text-button">Refresh</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Time</th><th>Customer</th><th>Amount</th><th>Status</th><th>ID</th></tr></thead>
-          <tbody id="payments"><tr><td colspan="5" class="empty">Loading transactions…</td></tr></tbody>
-        </table>
+    <section id="payments-section" class="section">
+      <h2>Payments</h2>
+      <div class="payment-grid">
+        <div class="panel">
+          <h3>New transaction</h3>
+          <p class="muted">Writes a payment record to the lab database. No money is charged.</p>
+          <form id="payment-form">
+            <label>Customer name<input name="customerName" maxlength="80" required></label>
+            <div class="form-row">
+              <label>Amount<input name="amount" required inputmode="decimal" pattern="[0-9]+([.][0-9]{1,2})?"></label>
+              <label>Currency<select name="currency"><option>USD</option><option>INR</option><option>EUR</option><option>GBP</option></select></label>
+            </div>
+            <button type="submit">Save payment</button>
+            <p id="payment-feedback" class="muted" role="status"></p>
+          </form>
+        </div>
+        <div class="panel">
+          <header class="panel-header"><h3>Recent payments</h3><button id="refresh-payments" type="button" class="secondary">Refresh</button></header>
+          <div class="table-wrap"><table>
+            <thead><tr><th scope="col">Time</th><th scope="col">Customer</th><th scope="col">Amount</th><th scope="col">Status</th></tr></thead>
+            <tbody id="payments"><tr><td colspan="4" class="empty">Loading transactions…</td></tr></tbody>
+          </table></div>
+        </div>
       </div>
     </section>
   </main>
-
-  <footer>Local observability and remediation lab · No real money is charged</footer>
-  <script src="/app.js"></script>
 </body>
 </html>
 

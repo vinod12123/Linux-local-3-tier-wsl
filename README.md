@@ -48,6 +48,8 @@ The recovery console reports success after Docker confirms the exit or the conta
 
 If Nginx is stopped or crashed, open the recovery console directly on port `18082` to restore it.
 
+The **Request tests** section sends traffic through Nginx. It can read payments, trigger a recovered Go handler panic, run a PostgreSQL query that fails with division by zero, or run a two-second PostgreSQL query. The results table displays observed HTTP responses and browser-measured duration. Batches are bounded to the counts on the buttons.
+
 ## ASTRA host-agent checklist
 
 Install/re-enrol the current Linux host agent in the organization being tested and enable:
